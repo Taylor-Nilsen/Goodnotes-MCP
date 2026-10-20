@@ -54,6 +54,10 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 }
 ```
 
+### Remote (custom connector URL)
+
+Set `PORT` and the server speaks Streamable HTTP at `/mcp/<MCP_TOKEN>` instead of stdio. The `Dockerfile` runs it with Playwright's Chromium. Deploy it anywhere that runs Docker with at least ~1 GB RAM, set `MCP_TOKEN` to a long random string, and add `https://<host>/mcp/<MCP_TOKEN>` as a custom connector in Claude.
+
 Set `GOODNOTES_CHROMIUM` to a Chrome or Chromium binary path to use that instead of Playwright's download.
 
 ## Notes

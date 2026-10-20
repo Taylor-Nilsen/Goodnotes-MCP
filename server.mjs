@@ -3,6 +3,8 @@
 // so the Goodnotes web app keeps syncing in the background, and screenshots pages on demand.
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import http from 'node:http';
 import { chromium } from 'playwright';
 import { z } from 'zod';
 
@@ -83,7 +85,15 @@ async function docInfo(link) {
 
 const seen = new Map(); // `${link} ${pageId}` -> { lastModified, jpg } from the last screenshot of that page
 
-async function screenshotPage(link, n) {
+// One viewer tab per link, so page views on the same link take turns.
+const queues = new Map(); // link -> Promise
+function queued(link, fn) {
+  const run = (queues.get(link) ?? Promise.resolve()).then(fn);
+  queues.set(link, run.catch(() => {}));
+  return run;
+}
+
+const screenshotPage = (link, n) => queued(link, async () => {
   const { pages } = await docInfo(link);
   const p = pages[n - 1];
   if (!p) throw new Error(`Page ${n} out of range, document has ${pages.length} pages`);
@@ -98,62 +108,78 @@ async function screenshotPage(link, n) {
   }
   seen.set(`${link} ${p.id}`, { lastModified: p.lastModified, jpg });
   return { jpg, total: pages.length };
+});
+
+function makeServer() {
+  const server = new McpServer({ name: 'goodnotes', version: '0.2.0' }, {
+    instructions: 'Whenever the user shares a Goodnotes link (https://web.goodnotes.com/s/...), use these tools to look at it: '
+      + 'call goodnotes_info, then view pages with goodnotes_page. The document is live: the user may keep writing on it during the chat. '
+      + 'When they refer to something in it ("check this step", "what I just wrote"), call goodnotes_info to see which pages changed, '
+      + 'then view those pages again rather than relying on an earlier screenshot.',
+  });
+  const linkArg = z.string().describe('Goodnotes share link, like https://web.goodnotes.com/s/abc123');
+  const text = (o) => ({ content: [{ type: 'text', text: JSON.stringify(o, null, 1) }] });
+
+  server.registerTool('goodnotes_info', {
+    description: 'Open a Goodnotes share link (kept open and syncing live). Returns the title and every page with its last edit time '
+      + 'and whether it changed since you last viewed it. Use this to find the page the user is working on.',
+    inputSchema: { link: linkArg },
+  }, async ({ link }) => {
+    getTab(link).catch(() => {}); // start loading the viewer now so the first page view is faster
+    const { title, pages } = await docInfo(link);
+    return text({
+      title,
+      pageCount: pages.length,
+      pages: pages.map((p) => ({
+        page: p.page,
+        lastEdited: new Date(p.lastModified).toISOString(),
+        changedSinceViewed: seen.has(`${link} ${p.id}`) ? p.lastModified > seen.get(`${link} ${p.id}`).lastModified : 'not viewed yet',
+      })),
+      now: new Date().toISOString(),
+    });
+  });
+
+  server.registerTool('goodnotes_page', {
+    description: 'See one page of a Goodnotes document exactly as it looks right now: an image of the page with handwriting, '
+      + 'drawings, PDFs and images. Call it again to see new edits. Go through pages one call at a time to scroll the document.',
+    inputSchema: { link: linkArg, page: z.number().int().min(1).describe('1-based page number') },
+  }, async ({ link, page }) => {
+    const { jpg, total } = await screenshotPage(link, page);
+    return { content: [
+      { type: 'text', text: `Page ${page} of ${total}` },
+      { type: 'image', data: jpg.toString('base64'), mimeType: 'image/jpeg' },
+    ] };
+  });
+
+  server.registerTool('goodnotes_wait_for_edit', {
+    description: 'Wait until the user edits the Goodnotes document (for "watch while I write"), then return which pages changed. '
+      + 'Times out after `seconds` with no change.',
+    inputSchema: { link: linkArg, seconds: z.number().int().min(5).max(600).optional().describe('Max wait, default 50') },
+  }, async ({ link, seconds = 50 }) => {
+    const before = new Map((await docInfo(link)).pages.map((p) => [p.id, p.lastModified]));
+    for (const end = Date.now() + seconds * 1000; Date.now() < end; await sleep(3000)) {
+      const changed = (await docInfo(link)).pages.filter((p) => p.lastModified !== before.get(p.id));
+      if (changed.length) {
+        await sleep(5000); // let the stroke finish syncing to the viewer
+        return text({ changedPages: changed.map((p) => p.page) });
+      }
+    }
+    return text({ changedPages: [], note: `No edits in ${seconds} s` });
+  });
+
+  return server;
 }
 
-const server = new McpServer({ name: 'goodnotes', version: '0.2.0' }, {
-  instructions: 'Whenever the user shares a Goodnotes link (https://web.goodnotes.com/s/...), use these tools to look at it: '
-    + 'call goodnotes_info, then view pages with goodnotes_page. The document is live: the user may keep writing on it during the chat. '
-    + 'When they refer to something in it ("check this step", "what I just wrote"), call goodnotes_info to see which pages changed, '
-    + 'then view those pages again rather than relying on an earlier screenshot.',
-});
-const linkArg = z.string().describe('Goodnotes share link, like https://web.goodnotes.com/s/abc123');
-const text = (o) => ({ content: [{ type: 'text', text: JSON.stringify(o, null, 1) }] });
-
-server.registerTool('goodnotes_info', {
-  description: 'Open a Goodnotes share link (kept open and syncing live). Returns the title and every page with its last edit time '
-    + 'and whether it changed since you last viewed it. Use this to find the page the user is working on.',
-  inputSchema: { link: linkArg },
-}, async ({ link }) => {
-  getTab(link).catch(() => {}); // start loading the viewer now so the first page view is faster
-  const { title, pages } = await docInfo(link);
-  return text({
-    title,
-    pageCount: pages.length,
-    pages: pages.map((p) => ({
-      page: p.page,
-      lastEdited: new Date(p.lastModified).toISOString(),
-      changedSinceViewed: seen.has(`${link} ${p.id}`) ? p.lastModified > seen.get(`${link} ${p.id}`).lastModified : 'not viewed yet',
-    })),
-    now: new Date().toISOString(),
-  });
-});
-
-server.registerTool('goodnotes_page', {
-  description: 'See one page of a Goodnotes document exactly as it looks right now: an image of the page with handwriting, '
-    + 'drawings, PDFs and images. Call it again to see new edits. Go through pages one call at a time to scroll the document.',
-  inputSchema: { link: linkArg, page: z.number().int().min(1).describe('1-based page number') },
-}, async ({ link, page }) => {
-  const { jpg, total } = await screenshotPage(link, page);
-  return { content: [
-    { type: 'text', text: `Page ${page} of ${total}` },
-    { type: 'image', data: jpg.toString('base64'), mimeType: 'image/jpeg' },
-  ] };
-});
-
-server.registerTool('goodnotes_wait_for_edit', {
-  description: 'Wait until the user edits the Goodnotes document (for "watch while I write"), then return which pages changed. '
-    + 'Times out after `seconds` with no change.',
-  inputSchema: { link: linkArg, seconds: z.number().int().min(5).max(600).optional().describe('Max wait, default 50') },
-}, async ({ link, seconds = 50 }) => {
-  const before = new Map((await docInfo(link)).pages.map((p) => [p.id, p.lastModified]));
-  for (const end = Date.now() + seconds * 1000; Date.now() < end; await sleep(3000)) {
-    const changed = (await docInfo(link)).pages.filter((p) => p.lastModified !== before.get(p.id));
-    if (changed.length) {
-      await sleep(5000); // let the stroke finish syncing to the viewer
-      return text({ changedPages: changed.map((p) => p.page) });
-    }
-  }
-  return text({ changedPages: [], note: `No edits in ${seconds} s` });
-});
-
-await server.connect(new StdioServerTransport());
+if (process.env.PORT) {
+  // Remote mode (custom connector). MCP_TOKEN in the path keeps strangers off the server.
+  const path = `/mcp${process.env.MCP_TOKEN ? `/${process.env.MCP_TOKEN}` : ''}`;
+  http.createServer(async (req, res) => {
+    if (req.url !== path) return res.writeHead(404).end();
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
+    res.on('close', () => transport.close());
+    await makeServer().connect(transport);
+    await transport.handleRequest(req, res);
+  }).listen(Number(process.env.PORT));
+} else {
+  await makeServer().connect(new StdioServerTransport());
+}
