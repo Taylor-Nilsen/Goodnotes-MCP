@@ -4,14 +4,24 @@ MCP server that lets an agent view a Goodnotes document live from its share link
 
 It opens the link in headless Chromium and keeps the tab open, so the Goodnotes web viewer keeps syncing in the background, the same way the link stays in sync on a Mac. Each tool call screenshots the page as it looks right now, handwriting included.
 
+## How it works in a chat
+
+Paste a Goodnotes share link in any chat that has this MCP. The server tells Claude to open it whenever it sees one, so you don't have to ask. Claude then:
+
+- calls `goodnotes_info` to get the page list and when each page was last edited
+- views pages with `goodnotes_page` (real images of the page, handwriting and all, not OCR)
+- when you say "check what I just wrote", calls `goodnotes_info` again to see which pages changed since it last looked, and re-views those
+- for "watch while I write", calls `goodnotes_wait_for_edit`, which returns as soon as you edit something
+
 ## Tools
 
 | Tool | Args | Returns |
 |---|---|---|
-| `goodnotes_info` | `link` | title, page count |
-| `goodnotes_page` | `link`, `page` (1-based), `reload` (optional) | JPEG of that page, about 1267 x 1639 px |
+| `goodnotes_info` | `link` | title, page count, each page's last edit time and whether it changed since Claude last viewed it |
+| `goodnotes_page` | `link`, `page` (1-based) | image of that page as it looks now, 1267 x 1639 px |
+| `goodnotes_wait_for_edit` | `link`, `seconds` (default 50) | which pages changed, once you edit something |
 
-The first call on a link takes about 15 s to load the doc. After that each page takes about 5 to 10 s, mostly waiting for Goodnotes to finish drawing the ink.
+The first page view on a link takes about 20 to 30 s (loading the Goodnotes web app). After that each page takes about 5 to 10 s, mostly waiting for Goodnotes to draw the ink. If the viewer ever misses a sync (the API says a page changed but the image didn't), the server reloads the link on its own.
 
 ## Install
 

@@ -44,11 +44,6 @@ async function dismissPopups(page) {
   }
 }
 
-async function indicator(page) {
-  const [cur, total] = (await page.textContent('#pageIndicator')).match(/\d+/g).map(Number);
-  return { cur, total };
-}
-
 // Jump to page n via the thumbnail sidebar (the canvas itself only scrolls by mouse wheel, imprecisely).
 // Closing the sidebar leaves the page fit-to-width with its top right under the toolbar.
 async function goToPage(page, n) {
@@ -75,42 +70,90 @@ async function goToPage(page, n) {
   return clip;
 }
 
-const server = new McpServer({ name: 'goodnotes', version: '0.1.0' });
+// Goodnotes' public share API: title plus page ids in order, each with its last-edit time.
+async function docInfo(link) {
+  if (!LINK.test(link)) throw new Error(`Not a Goodnotes share link: ${link}`);
+  const id = link.split('/').pop();
+  const res = await fetch(`https://api.goodnotes.com/v3/documents/${id}`).catch(() => null);
+  const body = await res?.json().catch(() => null);
+  if (body?.type !== 'Ok') throw new Error('Link is not shared (sharing turned off or link deleted). Ask for a fresh share link.');
+  const { title, pageIds, pages } = body.document;
+  return { title, pages: pageIds.map((pid, i) => ({ page: i + 1, id: pid, lastModified: pages[pid]?.lastModified ?? 0 })) };
+}
+
+const seen = new Map(); // `${link} ${pageId}` -> { lastModified, jpg } from the last screenshot of that page
+
+async function screenshotPage(link, n) {
+  const { pages } = await docInfo(link);
+  const p = pages[n - 1];
+  if (!p) throw new Error(`Page ${n} out of range, document has ${pages.length} pages`);
+  const shoot = async () => { const page = await getTab(link); return page.screenshot({ clip: await goToPage(page, n), type: 'jpeg', quality: 85 }); };
+  let jpg = await shoot();
+  // The API says the page was edited but the viewer still shows the old pixels: it missed the sync, reload.
+  const prev = seen.get(`${link} ${p.id}`);
+  if (prev && p.lastModified > prev.lastModified && jpg.equals(prev.jpg)) {
+    (await tabs.get(link)).close();
+    tabs.delete(link);
+    jpg = await shoot();
+  }
+  seen.set(`${link} ${p.id}`, { lastModified: p.lastModified, jpg });
+  return { jpg, total: pages.length };
+}
+
+const server = new McpServer({ name: 'goodnotes', version: '0.2.0' }, {
+  instructions: 'Whenever the user shares a Goodnotes link (https://web.goodnotes.com/s/...), use these tools to look at it: '
+    + 'call goodnotes_info, then view pages with goodnotes_page. The document is live: the user may keep writing on it during the chat. '
+    + 'When they refer to something in it ("check this step", "what I just wrote"), call goodnotes_info to see which pages changed, '
+    + 'then view those pages again rather than relying on an earlier screenshot.',
+});
 const linkArg = z.string().describe('Goodnotes share link, like https://web.goodnotes.com/s/abc123');
+const text = (o) => ({ content: [{ type: 'text', text: JSON.stringify(o, null, 1) }] });
 
 server.registerTool('goodnotes_info', {
-  description: 'Open a Goodnotes share link (kept open and syncing live) and return its title and page count.',
+  description: 'Open a Goodnotes share link (kept open and syncing live). Returns the title and every page with its last edit time '
+    + 'and whether it changed since you last viewed it. Use this to find the page the user is working on.',
   inputSchema: { link: linkArg },
 }, async ({ link }) => {
-  const page = await getTab(link);
-  const { cur, total } = await indicator(page);
-  const title = await page.evaluate(() => document.querySelector('header, [class*="toolbar"]')?.innerText.split('\n')[0] ?? '');
-  return { content: [{ type: 'text', text: JSON.stringify({ title, pages: total, currentPage: cur }) }] };
+  getTab(link).catch(() => {}); // start loading the viewer now so the first page view is faster
+  const { title, pages } = await docInfo(link);
+  return text({
+    title,
+    pageCount: pages.length,
+    pages: pages.map((p) => ({
+      page: p.page,
+      lastEdited: new Date(p.lastModified).toISOString(),
+      changedSinceViewed: seen.has(`${link} ${p.id}`) ? p.lastModified > seen.get(`${link} ${p.id}`).lastModified : 'not viewed yet',
+    })),
+    now: new Date().toISOString(),
+  });
 });
 
 server.registerTool('goodnotes_page', {
-  description: 'Screenshot one page of a Goodnotes share link as it looks right now, including handwriting. '
-    + 'The link stays open and syncs live, so call again to see new edits (sync lag is a few seconds).',
-  inputSchema: {
-    link: linkArg,
-    page: z.number().int().min(1).describe('1-based page number'),
-    reload: z.boolean().optional().describe('Reload the link first, if edits are not showing up'),
-  },
-}, async ({ link, page: n, reload }) => {
-  let page = await getTab(link);
-  if (reload) {
-    await page.close();
-    tabs.delete(link);
-    page = await getTab(link);
-  }
-  const { total } = await indicator(page);
-  if (n > total) throw new Error(`Page ${n} out of range, document has ${total} pages`);
-  const clip = await goToPage(page, n);
-  const jpg = await page.screenshot({ clip, type: 'jpeg', quality: 85 });
+  description: 'See one page of a Goodnotes document exactly as it looks right now: an image of the page with handwriting, '
+    + 'drawings, PDFs and images. Call it again to see new edits. Go through pages one call at a time to scroll the document.',
+  inputSchema: { link: linkArg, page: z.number().int().min(1).describe('1-based page number') },
+}, async ({ link, page }) => {
+  const { jpg, total } = await screenshotPage(link, page);
   return { content: [
-    { type: 'text', text: `Page ${n} of ${total}` },
+    { type: 'text', text: `Page ${page} of ${total}` },
     { type: 'image', data: jpg.toString('base64'), mimeType: 'image/jpeg' },
   ] };
+});
+
+server.registerTool('goodnotes_wait_for_edit', {
+  description: 'Wait until the user edits the Goodnotes document (for "watch while I write"), then return which pages changed. '
+    + 'Times out after `seconds` with no change.',
+  inputSchema: { link: linkArg, seconds: z.number().int().min(5).max(600).optional().describe('Max wait, default 50') },
+}, async ({ link, seconds = 50 }) => {
+  const before = new Map((await docInfo(link)).pages.map((p) => [p.id, p.lastModified]));
+  for (const end = Date.now() + seconds * 1000; Date.now() < end; await sleep(3000)) {
+    const changed = (await docInfo(link)).pages.filter((p) => p.lastModified !== before.get(p.id));
+    if (changed.length) {
+      await sleep(5000); // let the stroke finish syncing to the viewer
+      return text({ changedPages: changed.map((p) => p.page) });
+    }
+  }
+  return text({ changedPages: [], note: `No edits in ${seconds} s` });
 });
 
 await server.connect(new StdioServerTransport());
