@@ -1,0 +1,15 @@
+{
+  "name": "goodnotes-mcp",
+  "version": "0.1.0",
+  "description": "MCP server that views Goodnotes shared links live",
+  "type": "module",
+  "bin": { "goodnotes-mcp": "server.mjs" },
+  "scripts": {
+    "postinstall": "playwright install chromium"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "playwright": "1.56.1",
+    "zod": "^3.25.0"
+  }
+}
